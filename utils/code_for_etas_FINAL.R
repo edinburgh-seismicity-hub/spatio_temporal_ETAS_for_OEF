@@ -951,7 +951,15 @@ sample.triggered <- function(theta, beta.p, th, xh, yh, n.ev, M0, T1, T2, bdy,
                               y = samp.locs@coords[,2])
     # return only the ones with time different from NA (the one with NA are outside the interval T1, T2)
     # even though it should not happen given how we built sample.omori
-    return(samp.points[!is.na(samp.points$ts),])
+    output <- samp.points[!is.na(samp.points$ts),]
+    if(nrow(output) == 0){
+      samp.points <- data.frame(x = 1, y = 1, ts = 1, mags = 1)
+      samp.points <- samp.points[-1,]
+      return(samp.points) 
+    } else {
+      return(output)  
+    }
+    
   }
 }
 
@@ -1850,17 +1858,24 @@ get_productivity_mag <- function(list.input, model.fit){
 
 
 convert.forecast <- function(date.string, period, area.oef){
+  if(period == 'day'){
+    period.length = 1
+  }
+  if(period == 'week'){
+    period.length = 7
+  }
   # load list of synthetic catalogs
-  x = load(paste0('fore.', date.string, '.', period, '.Rds'))
+  x = load(paste0('fore.', date.string, '.', 'week', '.Rds'))
   fore.cat.list = get(x)
   
   # convert string to Date obj
   date.string.2 <- gsub('T', ' ', date.string)
-  start.fore.date <- as.POSIXct(date.string.2, format = '%Y-%m-%d %H:%M:%OS') + 60
+  start.fore.date <- as.POSIXct(date.string.2, format = '%Y-%m-%d %H:%M:%OS')
+  end.fore.date <- start.fore.date + period.length*24*60*60
   # find events to be selcted and convert days differences in dates
   list.idx.sel <- lapply(fore.cat.list, function(x){
     transf.time <- list.output.bkg$time.int[1] + x$ts*60*60*24 
-    data.frame(idx.sel = transf.time > start.fore.date,
+    data.frame(idx.sel = transf.time > start.fore.date & transf.time < end.fore.date,
                time = transf.time)
   })
   # select simulated events after date.string
