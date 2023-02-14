@@ -2421,6 +2421,123 @@ sample.magnitudes <- function(n, beta.p, M0, Mc = NULL, distro = 'GR'){
   return(magnitudes)
 }
 
+forecast.to.pix.df <- function(start.fore.string, pix.mesh, list.input,
+                               fore.path){
+  start.fore <- as.POSIXct(start.fore.string, format = '%Y-%m-%d %H:%M:%OS')
+  date.start.cat <- as.POSIXct(list.input$time.int[1])
+  
+  start.fore.days <- as.numeric(difftime(start.fore, date.start.cat, units = 'days'))
+  
+  # calculate end date
+  end.fore <- start.fore + 60*60*24
+  # select observation in fore period
+  idx.obs <- list.input$catalog$time_date > start.fore & 
+    list.input$catalog$time_date <= end.fore
+  obs.sp <- list.input$catalog.bru.km[idx.obs,]
+  # load corresponding forecast
+  load(paste0(fore.path,'fore.', start.fore.string,'.day.Rds'))
+  single.forecast <- single.forecast.week
+  single.forecast <- lapply(single.forecast, \(x) 
+                            x[x$ts > start.fore.days & 
+                                x$ts <= (start.fore.days+1), ])
+  #return(nrow(single.forecast[[1]]))
+  #calculate observed number of events per pixel
+  over_obs <- over(obs.sp, pix.mesh, byid = TRUE)
+  table.pix <- table(over_obs$ID)
+  pix.mesh$count <- 0
+  pix.mesh$count[as.numeric(names(table.pix))] = table.pix
+  pix.mesh$logcount <- log(pix.mesh$count)
+  # calculate number of events per pixel per synthetic catalogue
+  fore.count.matrix = matrix(0, nrow = length(pix.mesh$ID), ncol = length(single.forecast))
+  counter.zeros = 0
+  for(j in 1:length(single.forecast)){
+    single.forecast.cat <- single.forecast[[j]]
+    if(is.null(single.forecast.cat)){
+      counter.zeros = counter.zeros + 1
+      next
+    }
+    if(nrow(single.forecast.cat) == 0){
+      counter.zeros = counter.zeros + 1
+      next
+    }
+    coordinates(single.forecast.cat) <- c('x', 'y')
+    proj4string(single.forecast.cat) <- pix.mesh@proj4string
+    single.forecast.cat <- spTransform(single.forecast.cat, pix.mesh@proj4string)
+    over_fore <- over(single.forecast.cat, pix.mesh, byid = TRUE)
+    table.pix.fore <- table(over_fore$ID)
+    fore.count.matrix[as.numeric(names(table.pix.fore)),j] = table.pix.fore
+  }
+  if(counter.zeros == length(single.forecast)){
+    print('no events')
+    output <- data.frame(x = 0,
+                         y = 0,
+                         count = 0,
+                         mean = 0,
+                         sd = 0,
+                         q0.025 = 0,
+                         q0.5 = 0,
+                         q0.975 = 0,
+                         date = 0)
+    return(output[-1,])
+  } else{
+    return(data.frame(x = pix.mesh@coords[,1],
+                      y = pix.mesh@coords[,2],
+                      count = pix.mesh$count,
+                      mean = apply(fore.count.matrix, 1, mean),
+                      sd = apply(fore.count.matrix, 1, sd),
+                      q0.025 =  apply(fore.count.matrix, 1, \(x) quantile(x, 0.025)),
+                      q0.5 = apply(fore.count.matrix, 1, \(x) quantile(x, 0.5)),
+                      q0.975 = apply(fore.count.matrix, 1, \(x)quantile(x, 0.975)),
+                      date = as.character(start.fore)))
+  }
+}
+
+
+N.test.stat <- function(start.fore.string, list.input,
+                        fore.path){
+  start.fore <- as.POSIXct(start.fore.string, format = '%Y-%m-%d %H:%M:%OS')
+  date.start.cat <- as.POSIXct(list.input$time.int[1])
+  
+  start.fore.days <- as.numeric(difftime(start.fore, date.start.cat, units = 'days'))
+  
+  # calculate end date
+  end.fore <- start.fore + 60*60*24
+  # select observation in fore period
+  idx.obs <- list.input$catalog$time_date > start.fore & 
+    list.input$catalog$time_date <= end.fore
+  obs.sp <- list.input$catalog.bru.km[idx.obs,]
+  # load corresponding forecast
+  load(paste0(fore.path,'fore.', start.fore.string,'.day.Rds'))
+  single.forecast <- single.forecast.week
+  single.forecast <- lapply(single.forecast, \(x) 
+                            x[x$ts > start.fore.days & 
+                                x$ts <= (start.fore.days+1), ])
+  single.forecast.df <- bind_rows(single.forecast)
+  N.fore <- vapply(1:10000, \(x) sum(single.forecast.df$idx.cat == x),0)
+  return(data.frame(date.fore = as.character(start.fore),
+                    prob.over = mean(N.fore >= nrow(obs.sp)),
+                    prob.under = mean(N.fore <= nrow(obs.sp))))
+}
+
+
+obs.to.forecast <- function(start.fore.string, list.input){
+  start.fore <- as.POSIXct(start.fore.string, format = '%Y-%m-%d %H:%M:%OS')
+  start.fore.m1 <- start.fore - 60*60*24
+  
+  # select observation in fore period
+  idx.obs <- list.input$catalog$time_date >= start.fore.m1 & 
+    list.input$catalog$time_date < start.fore
+  if(sum(idx.obs) == 0){
+    obs.sp <- list.input$catalog.bru.km[1,]
+    obs.sp$date.fore <- as.character(start.fore)
+    obs.sp <- obs.sp[-1,]
+  } else{
+    obs.sp <- list.input$catalog.bru.km[idx.obs,]
+    obs.sp$date.fore <- as.character(start.fore)
+  }
+  # load corresponding forecast
+  return(as.data.frame(obs.sp))
+}
 
 
 

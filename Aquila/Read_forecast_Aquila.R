@@ -9,6 +9,7 @@ library(maps)
 library(rgdal)
 library(dplyr)
 library(viridis)
+library(ggstar)
 source("utils/inlabru_import_functions.R")
 source('utils/code_for_etas_FINAL.R')
 
@@ -106,7 +107,6 @@ obs.list <- foreach(date.pred = dates_to_pred) %do% {
                   list.input = list.output.bkg)
 }  
 
-library(ggstar)
 obs.df <- bind_rows(obs.list)
 #obs.df$date.fore <- as.POSIXct(obs.df$date.fore)
 pdf('fore.grid.Aquila.pdf', width = 480/25, height = 480/35)
