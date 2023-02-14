@@ -1,0 +1,92 @@
+#######################
+# Sequence parameters #
+#######################
+
+start.date = "2016-01-01 00:00:00 BST"
+end.date = "2018-01-01 00:00:00 BST"
+magnitude.completeness = 2.99
+min.longitude = 10.5
+max.longitude = 16
+min.latitude = 40.5
+max.latitude = 45
+catalog.path = "data/HORUS_Ita_Catalog.txt"
+catalog.header = TRUE
+catalog.sep = '\t'
+catalog.skip = 0
+catalog.colnames = NULL
+proj.ESPG = 4326
+
+##########
+# Priors #
+##########
+
+a_mu = 0.3
+b_mu = 0.6
+a_K = -3
+b_K = 1.5
+a_alpha = 0.5
+b_alpha = 1.5
+a_c = -1
+b_c = 1.5
+a_p = -1
+b_p = 1.5
+r_sigma = 0.5
+
+##################
+# Initial values #
+##################
+
+th.mu.init = 0.5
+th.K.init = 0
+th.alpha.init = 0
+th.c.init = 0
+th.p.init = 0
+th.sigma.init = 0
+
+###################
+# Inlabru options #
+###################
+
+max_iter = 50
+max_step = 0.2
+num.threads = 5
+
+#################################
+# space-time binning parameters #
+#################################
+
+coef.t = 1 
+delta.t = 0.1
+Nmax = 7
+delta.sp = 0.1
+n.layer.sp = 8
+min.edge.sp = 0.1 
+                                   
+###############################
+# background model parameters #
+###############################
+
+mesh.max.edge.inner = 12
+mesh.max.edge.outer = 50
+mesh.cutoff = 12
+prior.sigma.value = 5
+prior.sigma.pr = 0.01
+prior.range.value = 50
+prior.range.pr = 0.01
+
+############
+# Forecast #
+############
+
+area.shape.path = 'shape_Area/rectangle_for_OEF.shp'
+n.periods = 60
+period.length = 1
+start.date.fore = "2009-04-06 00:00:00 BST"
+magnitude.update = 5
+
+###############
+# Output name #
+###############
+
+output.name = 'report_ETAS'
+

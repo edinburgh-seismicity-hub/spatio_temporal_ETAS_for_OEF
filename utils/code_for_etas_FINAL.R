@@ -392,9 +392,9 @@ Plot_grid <- function(xx, yy, delta_, n.layer, bdy_,
   
   #int_poly <- sp::Polygons(poly.list, ID = 'A')
   #int_poly <- sp::SpatialPolygons(list(int_poly))
-  proj4string(int_poly) <- crs_Ita_km
+  proj4string(int_poly) <- bdy_@proj4string
   if(displaypl){
-    ggplot()  + gg(int_poly) + gg(ama_bdy) + geom_point(aes(xx,yy)) +  
+    ggplot()  + gg(int_poly) + gg(bdy_) + geom_point(aes(xx,yy)) +  
       coord_fixed()  
   }
   else{
@@ -427,7 +427,7 @@ Find_sp_grid <- function(xx, yy, delta_, n.layer, bdy_, min.edge = 0.01){
                            y = coord.bdy[,2],
                            xx = xx,
                            yy = yy,
-                           layer.id = 'last')
+                           layer.id = 'last')               
     return(coord.df)
   }
   # find max number of layers
@@ -609,11 +609,11 @@ I.s_df <- function(coord.df, Sigma = diag(c(1,1))){
   y.max <- coord.df$y.max
   #print(Sigma.l)
   # calculate the integral for each row of the data.frame
-  sapply(1:nrow(p.loc), \(idx)
+  vapply(1:nrow(p.loc), \(idx)
          abs(pmvnorm(lower = c(x.min[idx], y.min[idx]), 
                      upper = c(x.max[idx], y.max[idx]), 
                      mean = p.loc[idx,], sigma = Sigma.l[[idx]],
-                     keepAttr = FALSE)))
+                     keepAttr = FALSE)), 0)
 }
 
 
@@ -687,6 +687,376 @@ inv.loggaus.t <- function(x, m, s){
 }
 
 
+### functions for model fitting
+ETAS.fit.spatial <- function(sample.s, 
+                               M0, T1, T2, bdy,
+                               coef_t = 1, delta.t = 0.1, N_max = 10,
+                               delta.sp = 0.1, n.layer.sp = -1, min.edge.sp = 1, 
+                               link.functions = list(mu = \(x) x,
+                                                     K = \(x) x,
+                                                     alpha = \(x) x,
+                                                     cc = \(x) x,
+                                                     pp = \(x) x,
+                                                     sigma = \(x) x), 
+                               bru.opt = list(bru_verbose = 3,
+                                              bru_max_iter = 50),
+                               ncore = 1){
+  
+  # create different data.frames
+  # first for background
+  df.0 <- data.frame(counts = 0, exposures = 1, part = 'background')
+  
+  ### create time bins 
+  cat('Start creating spatial grid...', '\n')
+  time.g.st <- Sys.time()
+  
+  df.j <- foreach(idx = 1:nrow(sample.s), .combine = rbind) %do% {
+    space.time.grid(data.point = sample.s[idx,], 
+                    delta.sp = delta.sp, 
+                    n.layer. = n.layer.sp, 
+                    min.edge. = min.edge.sp,
+                    coef.t = coef_t,
+                    delta.t = delta.t,
+                    N.max = N_max,
+                    T2. = T2,
+                    bdy. = bdy, displaygrid = FALSE)
+  } 
+  df.j$counts = 0
+  df.j$exposures = 1
+  df.j$part = 'triggered'
+  t.names <- unique(df.j$t.ref_layer)
+  sp.names <- unique(df.j$ref_layer)
+  time.sel <- df.j[sapply(t.names, \(bname) which(df.j$t.ref_layer == bname)[1]),]
+  space.sel <- df.j[sapply(sp.names, \(bname) which(df.j$ref_layer == bname)[1]),]
+  mapping.t <- match(df.j$t.ref_layer, t.names)
+  mapping.s <- match(df.j$ref_layer, sp.names)
+  
+  
+  cat('Finished creating spatial grid, time ', Sys.time() - time.g.st, '\n')   
+  
+  logLambda.h.inla <- function(th.K, th.alpha, th.c, th.p, th.sigma1, 
+                               th.sigma2, list.input, 
+                               M0, bdy, ncore_ = ncore){
+    theta_ <- c(0, 
+                link.functions$K(th.K[1]), 
+                link.functions$alpha(th.alpha[1]), 
+                link.functions$cc(th.c[1]), 
+                link.functions$pp(th.p[1]))
+
+    sigma.1 <- link.functions$sigma(th.sigma1[1])
+    sigma.2 <- link.functions$sigma(th.sigma2[1])
+    Sigma. <- matrix(c(sigma.1, 0, 0, sigma.2), byrow = TRUE, ncol = 2)
+    list.input$Sigma_ = Sigma.
+    
+    #cat('theta - LogL', theta_, '\n')
+    comp.list <- compute.grid(param. = theta_, list.input = list.input)
+    
+    # cat('Is.na = ', sum(is.na(log1p(comp.list$Is - 1))), "\n")
+    # cat('It.na = ', sum(is.na(log1p(comp.list$It - 1))), '\n')
+    # cat('Is.inf = ', sum(is.infinite(log1p(comp.list$Is - 1))), "\n")
+    # cat('It.inf = ', sum(is.infinite(log1p(comp.list$It - 1))), '\n')
+    # 
+    theta_[3]*(list.input$df_grid$mags - M0) + log(theta_[2]) + log(comp.list$It) + 
+      log(comp.list$Is)
+    
+  }
+  
+  
+  
+  # third is for the sum of the log intensities
+  df.s <- data.frame(counts = nrow(sample.s), exposures = 0, part = 'SL')
+  
+  
+  loglambda.inla <- function(th.mu, th.K, th.alpha, th.c, th.p, th.sigma1, th.sigma2,
+                             bkg, tt, xx, yy, 
+                             th, xh, yh, mh, M0, ncore_ = ncore){
+    
+    
+    th.p.df <- data.frame(th.mu = link.functions$mu(th.mu[1])*bkg, 
+                          th.K = link.functions$K(th.K[1]), 
+                          th.alpha = link.functions$alpha(th.alpha[1]), 
+                          th.c = link.functions$cc(th.c[1]), 
+                          th.p = link.functions$pp(th.p[1]))
+    #cat('th.mu', sum(th.p.df$th.mu <0), '\n')
+    sigma.1 <- link.functions$sigma(th.sigma1[1])
+    sigma.2 <- link.functions$sigma(th.sigma2[1])
+    
+    Sigma. <- matrix(c(sigma.1, 0, 0, sigma.2), byrow = TRUE, ncol = 2)
+    outp <- unlist(mclapply(1:length(tt), \(idx) 
+                            log(lambda(theta = as.numeric(th.p.df[idx,]), 
+                                       tt = tt[idx], 
+                                       xx = xx[idx], 
+                                       yy = yy[idx], 
+                                       th = th, xh = xh, yh = yh, mh = mh, M0 = M0, Sigma = Sigma.)),
+                            mc.cores = ncore_))
+    #cat('logl', sum(is.na(outp)), '\n')
+    mean(outp)
+  }
+  
+  
+  
+  df.total <- bind_rows(df.0, df.j, df.s)
+  list.input. <- list(t.names = t.names, 
+                      sp.names = sp.names,
+                      space.sel = space.sel,
+                      time.sel = time.sel,
+                      mapping.t = mapping.t,
+                      mapping.s = mapping.s,
+                      sample.s = sample.s,
+                      idx.bkg = df.total$part == 'background',
+                      idx.trig = df.total$part == 'triggered',
+                      idx.sl = df.total$part == 'SL',
+                      n.total = nrow(df.total),
+                      df_grid = df.j)
+  
+  pred.fun <- function(th.mu, th.K, th.alpha, th.c, th.p, th.sigma1,  th.sigma2,
+                       list.input, T1, T2, bdy, M0){
+    
+    out <- rep(0, list.input$n.total)
+    out[list.input$idx.bkg] <- log(link.functions$mu(th.mu[1])) + log(T2 - T1)
+    out[list.input$idx.trig] <- logLambda.h.inla(th.K = th.K, 
+                                                 th.alpha = th.alpha, 
+                                                 th.c = th.c, 
+                                                 th.p = th.p, 
+                                                 th.sigma1 = th.sigma1,
+                                                 th.sigma2 = th.sigma2,
+                                                 list.input = list.input,
+                                                 M0 = M0, bdy = bdy)
+    out[list.input$idx.sl] <- loglambda.inla(th.mu = th.mu, 
+                                             th.K = th.K, 
+                                             th.alpha = th.alpha, 
+                                             th.c = th.c, 
+                                             th.p = th.p,
+                                             th.sigma1 = th.sigma1,
+                                             th.sigma2 = th.sigma2,
+                                             bkg = list.input$sample.s$bkg,
+                                             tt = list.input$sample.s$ts, 
+                                             xx = list.input$sample.s$x, 
+                                             yy = list.input$sample.s$y,
+                                             th = list.input$sample.s$ts, 
+                                             xh = list.input$sample.s$x, 
+                                             yh = list.input$sample.s$y, 
+                                             mh = list.input$sample.s$mags, 
+                                             M0 = M0)
+    out
+    
+  }
+  
+  
+  
+  # creating formula for summation part
+  form.total <- counts ~ pred.fun(th.mu = th.mu,
+                                  th.K = th.K, 
+                                  th.alpha = th.alpha,
+                                  th.c = th.c, 
+                                  th.p = th.p, 
+                                  th.sigma1 = th.sigma1,
+                                  th.sigma2 = th.sigma2,
+                                  list.input = list.input.,
+                                  T1 = T1, T2 = T2, bdy = bdy, M0 = M0)
+  
+  
+  cmp.total <- counts ~ -1 + 
+    th.mu(1, model = 'linear', mean.linear = 0, prec.linear = 1) + 
+    th.K(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.alpha(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.c(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.p(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.sigma1(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.sigma2(1, model = 'linear', mean.linear = 0, prec.linear = 1)
+  
+  bru(components = cmp.total,
+      formula = form.total,
+      data = df.total,
+      family = 'Poisson',
+      options = append(bru.opt, list(E = df.total$exposure)))
+}
+
+
+ETAS.fit.magspace <- function(sample.s, 
+                         M0, T1, T2, bdy,
+                         coef_t = 1, delta.t = 0.1, N_max = 10,
+                         delta.sp = 0.1, n.layer.sp = -1, min.edge.sp = 1, 
+                         link.functions = list(mu = \(x) x,
+                                               K = \(x) x,
+                                               alpha = \(x) x,
+                                               cc = \(x) x,
+                                               pp = \(x) x,
+                                               sigma = \(x) x), 
+                         bru.opt = list(bru_verbose = 3,
+                                        bru_max_iter = 50),
+                         ncore = 1){
+  
+  # create different data.frames
+  # first for background
+  df.0 <- data.frame(counts = 0, exposures = 1, part = 'background')
+  
+  ### create time bins 
+  cat('Start creating spatial grid...', '\n')
+  time.g.st <- Sys.time()
+  
+  df.j <- foreach(idx = 1:nrow(sample.s), .combine = rbind) %do% {
+    space.time.grid(data.point = sample.s[idx,], 
+                    delta.sp = delta.sp, 
+                    n.layer. = n.layer.sp, 
+                    min.edge. = min.edge.sp,
+                    coef.t = coef_t,
+                    delta.t = delta.t,
+                    N.max = N_max,
+                    T2. = T2,
+                    bdy. = bdy, displaygrid = FALSE)
+  } 
+  df.j$counts = 0
+  df.j$exposures = 1
+  df.j$part = 'triggered'
+  t.names <- unique(df.j$t.ref_layer)
+  sp.names <- unique(df.j$ref_layer)
+  time.sel <- df.j[sapply(t.names, \(bname) which(df.j$t.ref_layer == bname)[1]),]
+  space.sel <- df.j[sapply(sp.names, \(bname) which(df.j$ref_layer == bname)[1]),]
+  mapping.t <- match(df.j$t.ref_layer, t.names)
+  mapping.s <- match(df.j$ref_layer, sp.names)
+  
+  
+  cat('Finished creating spatial grid, time ', Sys.time() - time.g.st, '\n')   
+  
+  logLambda.h.inla <- function(th.K, th.alpha, th.c, th.p, th.sigma1, 
+                               th.sigma2, list.input, 
+                               M0, bdy, ncore_ = ncore){
+    theta_ <- c(0, 
+                link.functions$K(th.K[1]), 
+                th.alpha[1], 
+                link.functions$cc(th.c[1]), 
+                link.functions$pp(th.p[1]))
+    
+    sigma.1 <- link.functions$sigma(th.sigma1[1])
+    sigma.2 <- link.functions$sigma(th.sigma2[1])
+    Sigma. <- matrix(c(sigma.1, 0, 0, sigma.2), byrow = TRUE, ncol = 2)
+    list.input$Sigma_ = Sigma.
+    
+    #cat('theta - LogL', theta_, '\n')
+    comp.list <- compute.grid(param. = theta_, list.input = list.input)
+    
+    # cat('Is.na = ', sum(is.na(log1p(comp.list$Is - 1))), "\n")
+    # cat('It.na = ', sum(is.na(log1p(comp.list$It - 1))), '\n')
+    # cat('Is.inf = ', sum(is.infinite(log1p(comp.list$Is - 1))), "\n")
+    # cat('It.inf = ', sum(is.infinite(log1p(comp.list$It - 1))), '\n')
+    # 
+    theta_[3]*(list.input$df_grid$mags - M0) + log(theta_[2]) + log(comp.list$It) + 
+      log(comp.list$Is)
+    
+  }
+  
+  
+  
+  # third is for the sum of the log intensities
+  df.s <- data.frame(counts = nrow(sample.s), exposures = 0, part = 'SL')
+  
+  
+  loglambda.inla <- function(th.mu, th.K, th.alpha, th.c, th.p, th.sigma1, th.sigma2,
+                             bkg, tt, xx, yy, 
+                             th, xh, yh, mh, M0, ncore_ = ncore){
+    
+    
+    th.p.df <- data.frame(th.mu = link.functions$mu(th.mu[1])*bkg, 
+                          th.K = link.functions$K(th.K[1]), 
+                          th.alpha = th.alpha[1], 
+                          th.c = link.functions$cc(th.c[1]), 
+                          th.p = link.functions$pp(th.p[1]))
+    #cat('th.mu', sum(th.p.df$th.mu <0), '\n')
+    sigma.1 <- link.functions$sigma(th.sigma1[1])
+    sigma.2 <- link.functions$sigma(th.sigma2[1])
+    
+    Sigma. <- matrix(c(sigma.1, 0, 0, sigma.2), byrow = TRUE, ncol = 2)
+    outp <- unlist(mclapply(1:length(tt), \(idx) 
+                            log(lambda(theta = as.numeric(th.p.df[idx,]), 
+                                       tt = tt[idx], 
+                                       xx = xx[idx], 
+                                       yy = yy[idx], 
+                                       th = th, xh = xh, yh = yh, mh = mh, M0 = M0, Sigma = Sigma.)),
+                            mc.cores = ncore_))
+    #cat('logl', sum(is.na(outp)), '\n')
+    mean(outp)
+  }
+  
+  
+  
+  df.total <- bind_rows(df.0, df.j, df.s)
+  list.input. <- list(t.names = t.names, 
+                      sp.names = sp.names,
+                      space.sel = space.sel,
+                      time.sel = time.sel,
+                      mapping.t = mapping.t,
+                      mapping.s = mapping.s,
+                      sample.s = sample.s,
+                      idx.bkg = df.total$part == 'background',
+                      idx.trig = df.total$part == 'triggered',
+                      idx.sl = df.total$part == 'SL',
+                      n.total = nrow(df.total),
+                      df_grid = df.j)
+  
+  pred.fun <- function(th.mu, th.K, th.alpha, th.c, th.p, th.sigma1,  th.sigma2,
+                       list.input, T1, T2, bdy, M0){
+    
+    out <- rep(0, list.input$n.total)
+    out[list.input$idx.bkg] <- log(link.functions$mu(th.mu[1])) + log(T2 - T1)
+    out[list.input$idx.trig] <- logLambda.h.inla(th.K = th.K, 
+                                                 th.alpha = th.alpha, 
+                                                 th.c = th.c, 
+                                                 th.p = th.p, 
+                                                 th.sigma1 = th.sigma1,
+                                                 th.sigma2 = th.sigma2,
+                                                 list.input = list.input,
+                                                 M0 = M0, bdy = bdy)
+    out[list.input$idx.sl] <- loglambda.inla(th.mu = th.mu, 
+                                             th.K = th.K, 
+                                             th.alpha = th.alpha, 
+                                             th.c = th.c, 
+                                             th.p = th.p,
+                                             th.sigma1 = th.sigma1,
+                                             th.sigma2 = th.sigma2,
+                                             bkg = list.input$sample.s$bkg,
+                                             tt = list.input$sample.s$ts, 
+                                             xx = list.input$sample.s$x, 
+                                             yy = list.input$sample.s$y,
+                                             th = list.input$sample.s$ts, 
+                                             xh = list.input$sample.s$x, 
+                                             yh = list.input$sample.s$y, 
+                                             mh = list.input$sample.s$mags, 
+                                             M0 = M0)
+    out
+    
+  }
+  
+  
+  
+  # creating formula for summation part
+  form.total <- counts ~ pred.fun(th.mu = th.mu,
+                                  th.K = th.K, 
+                                  th.alpha = th.alpha,
+                                  th.c = th.c, 
+                                  th.p = th.p, 
+                                  th.sigma1 = th.sigma1,
+                                  th.sigma2 = th.sigma2,
+                                  list.input = list.input.,
+                                  T1 = T1, T2 = T2, bdy = bdy, M0 = M0)
+  
+  
+  cmp.total <- counts ~ -1 + 
+    th.mu(1, model = 'linear', mean.linear = 0, prec.linear = 1) + 
+    th.K(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.alpha(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.c(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.p(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.sigma1(1, model = 'linear', mean.linear = 0, prec.linear = 1) +
+    th.sigma2(1, model = 'linear', mean.linear = 0, prec.linear = 1)
+  
+  bru(components = cmp.total,
+      formula = form.total,
+      data = df.total,
+      family = 'Poisson',
+      options = append(bru.opt, list(E = df.total$exposure)))
+}
+
 
 ### functions for model fitting
 ETAS.fit.isotropic <- function(sample.s, 
@@ -742,7 +1112,7 @@ ETAS.fit.isotropic <- function(sample.s,
                 link.functions$alpha(th.alpha[1]), 
                 link.functions$cc(th.c[1]), 
                 link.functions$pp(th.p[1]))
-
+    
     sigma.1 <- link.functions$sigma(th.sigma[1])
     Sigma. <- matrix(c(sigma.1, 0, 0, sigma.1), byrow = TRUE, ncol = 2)
     list.input$Sigma_ = Sigma.
@@ -866,6 +1236,7 @@ ETAS.fit.isotropic <- function(sample.s,
 }
 
 
+
 ## integrated time-triggering function
 
 It <- function(theta, th, T2){
@@ -893,6 +1264,7 @@ sample.time <- function(theta, n.ev, th, T2){
   t.sample
 }
 
+
 # sampling locations
 sample.loc <- function(xh, yh, n.ev, bdy, Sigma, crs_obj. = NA){
   
@@ -906,7 +1278,9 @@ sample.loc <- function(xh, yh, n.ev, bdy, Sigma, crs_obj. = NA){
     coordinates(pts) <- ~ x + y
     #proj4string(pts) <- proj4string(bdy)
     # discard the ones outside bdy
-    pts <- crop(pts, bdy)
+    #keep.point <- pts$x >= bdy@bbox[1,1] & pts$x <= bdy@bbox[1,2] & 
+    #  pts$y >= bdy@bbox[2,1] & pts$y <= bdy@bbox[2,2]
+    pts <- crop(pts, bdy)#pts[keep.point,]#
     # merge sampled points
     if(num == 0){
       samp.points <- pts
@@ -929,7 +1303,7 @@ sample.loc <- function(xh, yh, n.ev, bdy, Sigma, crs_obj. = NA){
 
 # sampling triggered events
 sample.triggered <- function(theta, beta.p, th, xh, yh, n.ev, M0, T1, T2, bdy, 
-                             Sigma, crs_obj.){
+                             Sigma, crs_obj., Mc = NULL, mag.distro = 'GR'){
   # if the number of events to be placed is zero returns an empty data.frame
   if(n.ev == 0){
     samp.points <- data.frame(x = 1, y = 1, ts = 1, mags = 1)
@@ -941,14 +1315,21 @@ sample.triggered <- function(theta, beta.p, th, xh, yh, n.ev, M0, T1, T2, bdy,
     # sample times
     samp.ts <- sample.time(theta, n.ev, th, T2)
     # sample magnitudes
-    samp.mags <- rexp(n.ev, rate = beta.p) + M0
+    samp.mags <- sample.magnitudes(n = n.ev, 
+                                   beta.p = beta.p,
+                                   M0 = M0,
+                                   Mc = Mc, 
+                                   distro = mag.distro)
     # sample locations
     samp.locs <- sample.loc(xh = xh, yh = yh, n.ev = n.ev, 
                             bdy = bdy, Sigma = Sigma, crs_obj. = crs_obj.)
     
     # build output dataset
+    # samp.points <- data.frame(ts = samp.ts, mags = samp.mags, x = samp.locs$x,
+    #                           y = samp.locs$y)
+    # 
     samp.points <- data.frame(ts = samp.ts, mags = samp.mags, x = samp.locs@coords[,1],
-                              y = samp.locs@coords[,2])
+                               y = samp.locs@coords[,2])
     # return only the ones with time different from NA (the one with NA are outside the interval T1, T2)
     # even though it should not happen given how we built sample.omori
     output <- samp.points[!is.na(samp.points$ts),]
@@ -965,7 +1346,7 @@ sample.triggered <- function(theta, beta.p, th, xh, yh, n.ev, M0, T1, T2, bdy,
 
 
 sample.generation <- function(theta, beta.p, Ht, M0, T1, T2, bdy,
-                              Sigma, crs_obj., ncore = 1){
+                              Sigma, crs_obj., ncore = 1, Mc = NULL, mag.distro = 'GR'){
   
   # number of parents
   n.parent <- nrow(Ht)
@@ -1009,7 +1390,8 @@ sample.generation <- function(theta, beta.p, Ht, M0, T1, T2, bdy,
   # sample (in parallel) the aftershocks for each parent 
   sample.list <- mclapply(idx.p, function(idx) 
     sample.triggered(theta, beta.p, Ht$ts[idx], Ht$x[idx], Ht$y[idx], n.ev.v[idx], M0, T1, T2, bdy, 
-                     Sigma_l[[idx]], crs_obj. = crs_obj.), mc.cores = ncore)
+                     Sigma_l[[idx]], crs_obj. = crs_obj., Mc = Mc, 
+                     mag.distro = mag.distro), mc.cores = ncore)
   
   # bind the data.frame in the list and return
   sample.pts <- bind_rows(sample.list) 
@@ -1027,7 +1409,7 @@ point_sampler <- function(loglambda, bdy, mesh, num_events,
   ## Number of events for single catalogue from a poisson distribution with lambda = num_events
   loglambda_max <- max(loglambda)
   ## number of points to sample at a time - might want to adjust depending on how many points you want to actually retain.
-  n.points=10000
+  n.points=1000
   
   ## Set up a spatialpoints dataframe for our results
   num <- 0
@@ -1042,7 +1424,7 @@ point_sampler <- function(loglambda, bdy, mesh, num_events,
     lambda_ratio <- exp(as.vector(proj$A %*% loglambda) - loglambda_max)
     keep <- proj$ok & (runif(n.points) <= lambda_ratio)
     if(sum(keep) == 0){
-      print('zero keeped')
+      print('zero kept')
       next
     }
     kept <- pts[keep]
@@ -1066,7 +1448,7 @@ point_sampler <- function(loglambda, bdy, mesh, num_events,
 sample.ETAS <- function(theta, beta.p, M0, T1, T2, bdy, Sigma = NULL, 
                         loglambda.bkg = NULL, mesh.bkg = NULL, 
                         crs_obj = NULL, Ht = NULL, ncore = 1,
-                        Unit.Area = TRUE){
+                        Unit.Area = TRUE, Mc = NULL, mag.distro = 'GR'){
   
   # if the upper extreme greater than lower
   if(T2 < T1){
@@ -1084,7 +1466,7 @@ sample.ETAS <- function(theta, beta.p, M0, T1, T2, bdy, Sigma = NULL,
     n.bkg <- rpois(1, theta[1]*(T2 - T1)*Area.bdy)
   }
   
-  cat('Background : ', n.bkg, '\n')
+  #cat('Background : ', n.bkg, '\n')
   # if no background events are generated initialize an empty data.frame
   if(n.bkg == 0){
     bkg.df <- data.frame(x = 1, y = 1, ts = 1, mags = 1, gen = 0)
@@ -1102,7 +1484,11 @@ sample.ETAS <- function(theta, beta.p, M0, T1, T2, bdy, Sigma = NULL,
       bkg.df <- data.frame(x = bkg.locs@coords[,1], 
                            y = bkg.locs@coords[,2], 
                            ts = runif(n.bkg, T1, T2), 
-                           mags = rexp(n.bkg, beta.p) + M0, 
+                           mags = sample.magnitudes(n = n.bkg, 
+                                                    beta.p = beta.p,
+                                                    M0 = M0,
+                                                    Mc = Mc, 
+                                                    distro = mag.distro), 
                            gen = 'background')
     }
     # otherwise it samples using the information provided
@@ -1115,7 +1501,11 @@ sample.ETAS <- function(theta, beta.p, M0, T1, T2, bdy, Sigma = NULL,
       bkg.df <- data.frame(x = data.frame(bkg.locs)$x, 
                            y = data.frame(bkg.locs)$y, 
                            ts = runif(n.bkg, T1, T2), 
-                           mags = rexp(n.bkg, beta.p) + M0, 
+                           mags = sample.magnitudes(n = n.bkg, 
+                                                    beta.p = beta.p,
+                                                    M0 = M0,
+                                                    Mc = Mc, 
+                                                    distro = mag.distro), 
                            gen = 'background')
     }
   }
@@ -1168,7 +1558,7 @@ sample.ETAS <- function(theta, beta.p, M0, T1, T2, bdy, Sigma = NULL,
       gen = gen + 1
     }
   }
-  cat('Building data.frame \n')
+  #cat('Building data.frame \n')
   df.ret <- bind_rows(Gen.list)
   df.ret <- df.ret %>% 
     filter(ts >= T1, ts < T2) %>%
@@ -1634,7 +2024,6 @@ background.model <- function(list.input){
                                      list.input$lat.int), crs.obj, buff = 0.01)
   bdy.km <- spTransform(bdy, crs.obj_km)
   bdy.km <- square_poly_from_bbox(bdy.km@bbox, crs.obj = crs.obj_km, buff = 0)
-  ggplot() + gg(data.km) + gg(bdy.km)
   # create mesh 
   mesh_ <- inla.mesh.2d(boundary = bdy.km, 
                         max.edge = c(list.input$mesh.max.edge.inner, 
@@ -1715,9 +2104,58 @@ isotropic.ETAS.model <- function(list.input, num.cores = 5){
 }
 
 
+spatial.ETAS.model <- function(list.input, num.cores = 5){
+  data.bru <- data.frame(x = list.input$catalog.bru.km@coords[,1],
+                         y = list.input$catalog.bru.km@coords[,2],
+                         mags = list.input$catalog.bru.km$magnitudes,
+                         idx.p = list.input$catalog.bru.km$idx.p,
+                         ts = list.input$catalog.bru.km$ts,
+                         bkg = list.input$catalog.bru.km$bkg)
+  ETAS.fit.spatial(sample.s = data.bru, # data.frame representing data points 
+                     coef_t = list.input$coef.t, 
+                     delta.t = list.input$delta.t,  
+                     N_max = list.input$Nmax,
+                     delta.sp = list.input$delta.sp,
+                     n.layer.sp = list.input$n.layer.sp,
+                     min.edge.sp = list.input$min.edge.sp, 
+                     link.functions  = list.input$link.functions, 
+                     M0 = list.input$M0, 
+                     T1 = list.input$T12[1], 
+                     T2 = list.input$T12[2], 
+                     bdy = list.input$bdy.km, # SpatialPolygon representing study region (has to be squared)
+                     bru.opt = list.input$bru.opt.list, # verbose changes what inlabru prints 
+                     ncore = num.cores) # set number of cores
+}
+
+
+cov.ETAS.model <- function(list.input, num.cores = 5){
+  data.bru <- data.frame(x = list.input$catalog.bru.km@coords[,1],
+                         y = list.input$catalog.bru.km@coords[,2],
+                         mags = list.input$catalog.bru.km$magnitudes,
+                         idx.p = list.input$catalog.bru.km$idx.p,
+                         ts = list.input$catalog.bru.km$ts,
+                         bkg = list.input$catalog.bru.km$bkg)
+  ETAS.fit.cov(sample.s = data.bru, # data.frame representing data points 
+                   coef_t = list.input$coef.t, 
+                   delta.t = list.input$delta.t,  
+                   N_max = list.input$Nmax,
+                   delta.sp = list.input$delta.sp,
+                   n.layer.sp = list.input$n.layer.sp,
+                   min.edge.sp = list.input$min.edge.sp, 
+                   link.functions  = list.input$link.functions, 
+                   M0 = list.input$M0, 
+                   T1 = list.input$T12[1], 
+                   T2 = list.input$T12[2], 
+                   bdy = list.input$bdy.km, # SpatialPolygon representing study region (has to be squared)
+                   bru.opt = list.input$bru.opt.list, # verbose changes what inlabru prints 
+                   ncore = num.cores) # set number of cores
+}
+
+
 get_posterior <- function(link.functions, model_fit, par.names){
   post.list <- lapply(1:length(model_fit$marginals.fixed), \(x) 
-                      data.frame(inla.tmarginal(link.functions[[x]], model_fit$marginals.fixed[[x]]),
+                      data.frame(inla.tmarginal(link.functions[[x]], 
+                                                model_fit$marginals.fixed[[x]]),
                                  param = par.names[x]))
   bind_rows(post.list)
 }
@@ -1734,33 +2172,36 @@ get_mean <- function(list.input, model.fit){
 }
 
 get_posterior_sample <- function(list.input, model.fit, n.samp, scale = 'ETAS'){
-  if(scale == 'ETAS'){
-    s.out <- data.frame(mu = inla.rmarginal(n.samp,
-                                            inla.tmarginal(list.input$link.functions$mu,
-                                                           model.fit$marginals.fixed$th.mu)),
-                        K = inla.rmarginal(n.samp,
-                                           inla.tmarginal(list.input$link.functions$K,
-                                                          model.fit$marginals.fixed$th.K)),
-                        alpha = inla.rmarginal(n.samp,
-                                               inla.tmarginal(list.input$link.functions$alpha,
-                                                              model.fit$marginals.fixed$th.alpha)),
-                        c = inla.rmarginal(n.samp,
-                                           inla.tmarginal(list.input$link.functions$cc,
-                                                          model.fit$marginals.fixed$th.c)),
-                        p = inla.rmarginal(n.samp,
-                                           inla.tmarginal(list.input$link.functions$pp,
-                                                          model.fit$marginals.fixed$th.p)),
-                        sigma = inla.rmarginal(n.samp,
-                                               inla.tmarginal(list.input$link.functions$sigma,
-                                                              model.fit$marginals.fixed$th.sigma)))
-  } else if(scale == 'Internal'){
+  if(n.samp > 1000){
+    s.list <- lapply(1:ceiling(n.samp/1000), function(x) 
+                       
+                       generate(model.fit, data.frame(), ~ c(th.mu = th.mu,
+                                                    th.K = th.K,
+                                                    th.alpha = th.alpha,
+                                                    th.c = th.c,
+                                                    th.p = th.p,
+                                                    th.sigma = th.sigma),
+                                n.samples = 1000) )
+    s.out <- bind_cols(s.list)
+  } else{
     s.out <- generate(model.fit, data.frame(), ~ c(th.mu = th.mu,
                                                    th.K = th.K,
                                                    th.alpha = th.alpha,
                                                    th.c = th.c,
                                                    th.p = th.p,
                                                    th.sigma = th.sigma),
-                      n.samples = n.samp) 
+                      n.samples = n.samp)
+  }
+  if(scale == 'ETAS'){
+    s.out <- data.frame(mu = list.input$link.functions$mu(s.out[1,]),
+                        K = list.input$link.functions$K(s.out[2,]),
+                        alpha = list.input$link.functions$alpha(s.out[3,]),
+                        c = list.input$link.functions$cc(s.out[4,]),
+                        p = list.input$link.functions$pp(s.out[5,]),
+                        sigma = list.input$link.functions$sigma(s.out[6,]))
+    
+    } else if(scale == 'Internal'){
+    
     s.out <- data.frame(mu = s.out[1,],
                         K = s.out[2,],
                         alpha = s.out[3,],
@@ -1781,7 +2222,7 @@ produce_single_forecast <- function(post.samples,
                                     increase.start.fore.sec = 60,
                                     list.input,
                                     T.retro,
-                                    crs_obj){
+                                    crs_obj, Mc = NULL, mag.distro = 'GR'){
   
   crs.obj <- CRS(SRS_string=paste0('EPSG:', 7794))
   crs.obj_km <- fm_crs_set_lengthunit(crs.obj, "km")
@@ -1799,7 +2240,7 @@ produce_single_forecast <- function(post.samples,
     Sigma.matrix <- matrix(c(post.samples[i,6], 0,
                              0, post.samples[i,6]), byrow = TRUE, ncol = 2)
     cat('catalog : ', i, '\n')
-    cat('param : ', as.numeric(post.samples[i,]), '\n')
+    #cat('param : ', as.numeric(post.samples[i,]), '\n')
     syn.catalog <- sample.ETAS(theta = as.numeric(post.samples[i,]),
                                beta.p = list.input$beta.p,
                                M0 = list.input$M0,
@@ -1812,7 +2253,8 @@ produce_single_forecast <- function(post.samples,
                                crs_obj = crs.obj, 
                                Ht = df.know,
                                ncore = 5, 
-                               Unit.Area = TRUE
+                               Unit.Area = TRUE, Mc = Mc, 
+                               mag.distro = mag.distro
     )
     if(nrow(syn.catalog) > 0){
       syn.catalog$idx.cat <- i
@@ -1857,25 +2299,30 @@ get_productivity_mag <- function(list.input, model.fit){
 }
 
 
-convert.forecast <- function(date.string, period, area.oef){
+convert.forecast <- function(date.string, start.cat.date, M.min, period, area.oef,
+                             folder.path= NULL){
   if(period == 'day'){
     period.length = 1
+    fore.name = 'day'
   }
   if(period == 'week'){
     period.length = 7
+    fore.name = 'week'
   }
   # load list of synthetic catalogs
-  x = load(paste0('fore.', date.string, '.', 'week', '.Rds'))
-  fore.cat.list = get(x)
+  fore = load(paste0('fore.', date.string, '.', fore.name, '.Rds'))
+  fore.cat.list = get(fore)
   
   # convert string to Date obj
-  date.string.2 <- gsub('T', ' ', date.string)
-  start.fore.date <- as.POSIXct(date.string.2, format = '%Y-%m-%d %H:%M:%OS')
+  #date.string.2 <- gsub('T', ' ', date.string)
+  start.fore.date <- as.POSIXct(date.string, format = '%Y-%m-%d %H:%M:%OS')
   end.fore.date <- start.fore.date + period.length*24*60*60
-  # find events to be selcted and convert days differences in dates
+  # find events to be selected and convert days differences in dates
   list.idx.sel <- lapply(fore.cat.list, function(x){
-    transf.time <- list.output.bkg$time.int[1] + x$ts*60*60*24 
-    data.frame(idx.sel = transf.time > start.fore.date & transf.time < end.fore.date,
+    transf.time <- start.cat.date + x$ts*60*60*24
+    idx.time.sel = (transf.time > start.fore.date) & (transf.time < end.fore.date)
+    idx.mag.sel = x$mags > M.min
+    data.frame(idx.sel = idx.time.sel & idx.mag.sel,
                time = transf.time)
   })
   # select simulated events after date.string
@@ -1887,24 +2334,101 @@ convert.forecast <- function(date.string, period, area.oef){
   # select events in area.oef region and merge all catalogs in unique data.frame
   final.forecast <- foreach(i = 1:length(list.fore.sel), .combine = rbind) %do% {
     fore.cat <- list.fore.sel[[i]]
-    fore.cat.sp <- fore.cat
-    coordinates(fore.cat.sp) <- c('x', 'y')
-    proj4string(fore.cat.sp) <- crs.obj_km
-    fore.cat.sp <- spTransform(fore.cat.sp, proj4string(area.oef))
-    fore.cat.sp <- crop(fore.cat.sp, area.oef)
-    fore.cat <- data.frame(Lon = fore.cat.sp@coords[,1],
-                           Lat = fore.cat.sp@coords[,2],
-                           Time = fore.cat.sp$time.date,
-                           Mag = fore.cat.sp$mags,
-                           Idx.cat = fore.cat.sp$idx.cat)
-    rownames(fore.cat) <- NULL
-    fore.cat
+    if(is.null(nrow(fore.cat))){
+      fore.cat <- data.frame(Lon = 1,
+                             Lat = 1,
+                             Time = 1,
+                             Mag = 1,
+                             Idx.cat = 1)
+      fore.cat <- fore.cat[-1,]
+    }
+    else{
+      if(nrow(fore.cat) > 0){
+        fore.cat.sp <- fore.cat
+        coordinates(fore.cat.sp) <- c('x', 'y')
+        proj4string(fore.cat.sp) <- crs.obj_km
+        fore.cat.sp <- spTransform(fore.cat.sp, proj4string(area.oef))
+        fore.cat.sp <- crop(fore.cat.sp, area.oef)
+        if(is.null(fore.cat.sp)){
+          fore.cat <- data.frame(Lon = 1,
+                                 Lat = 1,
+                                 Time = 1,
+                                 Mag = 1,
+                                 Idx.cat = 1)
+          fore.cat <- fore.cat[-1,]
+        } else {
+          fore.cat <- data.frame(Lon = fore.cat.sp@coords[,1],
+                                 Lat = fore.cat.sp@coords[,2],
+                                 Time = gsub(' ', 'T', fore.cat.sp$time.date),
+                                 Mag = fore.cat.sp$mags,
+                                 Idx.cat = fore.cat.sp$idx.cat)  
+        }
+      }
+      else{
+        fore.cat <- data.frame(Lon = 1,
+                               Lat = 1,
+                               Time = 1,
+                               Mag = 1,
+                               Idx.cat = 1)
+        fore.cat <- fore.cat[-1,]
+      }
+      rownames(fore.cat) <- NULL
+      fore.cat
+    }
   }
+  date.name <- gsub(' ', 'T', date.string)
   write.table(final.forecast, 
-              file = paste0('ufficial.aquila.forecasts/forecast.', date.string, period,'.txt'),
+              file = paste0(folder.path, 'forecast.', date.name, period,'.txt'),
               row.names = FALSE,
               sep = ',')
 }
+
+
+
+
+
+sample.tapGR <- function(n, beta.p, Mc, M0){
+  b = beta.p/log(10)
+  beta.tapGR <- (2/3)*b
+  Mom0 <- 10^( (3/2)*M0 + 9.1) 
+  Momc <- 10^( (3/2)*Mc + 9.1) 
+  R1 = runif(n, 0, 1)
+  R2 = runif(n, 0, 1)
+  
+  M1 = Mom0*(R1^(-1/beta.tapGR))
+  M2 = Mom0 - Momc*log(R2)
+  
+  moments = pmin(M1 , M2)
+  magnitudes = 2/3 * (log10(moments) - 9.1)
+  return(magnitudes)
+}
+
+
+sample.magnitudes <- function(n, beta.p, M0, Mc = NULL, distro = 'GR'){
+  if(distro == 'GR'){
+    magnitudes = rexp(n, beta.p) + M0
+  }
+  else if(distro == 'Tap-GR'){
+    if(is.null(Mc)){
+      stop('Corner magnitude (Mc) is missing with no default')
+    }
+    else{
+      magnitudes = sample.tapGR(n = n, beta.p = beta.p, Mc = Mc, M0 = M0)
+    }
+  } else {
+    stop("Unknown distribution please choose between 'GR' and 'Tap-GR")
+  }
+  return(magnitudes)
+}
+
+
+
+
+
+
+
+
+
 
 
 
